@@ -3,9 +3,12 @@ Vyron OS: выставить лоты оптимизации во все нуж�
 
 Команды в Telegram-боте Кардинала (только для авторизованных пользователей бота):
   /vyron_lots_backup        сохранить копию ВСЕХ ваших лотов (поля формы) в storage/plugins/vyron_lots_backup_*.json
-  /vyron_lots_preview       показать, какие лоты будут удалены и какие созданы (ничего не меняет)
-  /vyron_lots_apply YES     сделать копию, удалить старые лоты оптимизации и выставить новые
-  /vyron_lots_restore       вернуть лоты из последней копии (создаёт их заново)
+  /vyron_lots_preview       показать, в каких разделах лоты будут заменены (ничего не меняет)
+  /vyron_lots_apply YES     по разделам: выставить 3 новых лота, и только потом удалить старые лоты оптимизации этого раздела
+  /vyron_lots_stop          остановить замену после текущего раздела (повторный apply продолжит с места остановки)
+  /vyron_lots_restore       вернуть удалённые лоты из всех копий (создаёт их заново)
+
+Замена идёт в КАЖДОМ разделе, где сейчас есть ваши лоты оптимизации, плюс разделы NODES.
 
 Тексты и лимиты: длину полей плагин читает из формы FunPay (maxlength) и собирает описание из блоков
 по важности, пока они помещаются, так что текст никогда не обрывается на полуслове.
@@ -16,11 +19,12 @@ import glob
 import json
 import os
 import re
+import threading
 import time
 from logging import getLogger
 
 NAME = "Vyron OS Lots"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = "Выставляет лоты Vyron OS во все разделы оптимизации FunPay (с копией и откатом)."
 CREDITS = "Vyron OS"
 UUID = "8b2e5d71-4c9a-4f36-b1d2-7e0a9c3f6a18"
@@ -221,93 +225,176 @@ def _storage(name: str) -> str:
     return os.path.join(d, name)
 
 
+def _new_backup_path() -> str:
+    """A backup file name no earlier run has used (two runs in one second must not overwrite each other's copy)."""
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    n = 0
+    while True:
+        path = _storage(f"vyron_lots_backup_{stamp}{'_' + str(n) if n else ''}.json")
+        if not os.path.exists(path):
+            return path
+        n += 1
+
+
 def backup(c) -> tuple[str, int]:
     saved = []
     for lot in _my_lots(c):
         try:
-            f = c.account.get_lot_fields(lot.id)
-            node = getattr(getattr(lot, "subcategory", None), "id", None)
-            saved.append({"id": lot.id, "node": node, "title": lot.description, "fields": f.fields})
+            saved.append(_backup_entry(c, lot))
         except Exception as ex:
             logger.warning(f"[vyron_lots] копия лота {lot.id} не снята: {ex}")
         time.sleep(PAUSE / 2)
-    path = _storage(f"vyron_lots_backup_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    path = _new_backup_path()
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(saved, fh, ensure_ascii=False, indent=1)
     return path, len(saved)
 
 
-def plan(c) -> tuple[list, list]:
-    """(lots to delete, [(node, game, tier)] to create)"""
-    lots = _my_lots(c)
-    delete = [l for l in lots if _is_optimization(l.description)]
-    create = [(node, game, t) for node, game in NODES.items() for t in TIERS]
-    return delete, create
+def _backup_entry(c, lot) -> dict:
+    f = c.account.get_lot_fields(lot.id)
+    return {"id": lot.id, "node": _node(lot), "title": lot.description, "fields": f.fields}
 
 
-def _template(c, node: int, mine: dict):
+def _node(lot):
+    return getattr(getattr(lot, "subcategory", None), "id", None)
+
+
+def _game(lot, node) -> str:
+    """The game of a lot's section, e.g. «Counter-Strike 2»; the fixed NODES names win."""
+    if node in NODES:
+        return NODES[node]
+    sub = getattr(lot, "subcategory", None)
+    cat = getattr(sub, "category", None)
+    name = getattr(cat, "name", None) or getattr(sub, "fullname", None) or ""
+    name = str(name).strip()
+    return name if name and name.lower() not in ("прочие игры", "other games") else "любых игр"
+
+
+def _g_ru(game: str) -> str:
+    return "ДЛЯ " + (game.upper() if game != "любых игр" else "ЛЮБЫХ ИГР")
+
+
+def _g_en(game: str) -> str:
+    return "FOR " + (game.upper() if game != "любых игр" else "ANY GAME")
+
+
+def _tier_of(title: str, game: str):
+    """The tier key if `title` is one of the new Vyron lots for this game (its first « | » segment), else None."""
+    t = (title or "").split("|")[0].strip().upper()
+    for tier in TIERS:
+        for tpl, g in ((tier["title_ru"], _g_ru(game)), (tier["title_en"], _g_en(game))):
+            if t == tpl.split("|")[0].strip().format(g=g).upper():
+                return tier["key"]
+    return None
+
+
+def plan(c) -> dict:
+    """{node: {"game": str, "old": [lots to replace], "have": {tier keys already there}, "template": lot id or None}} —
+    every section where I sell optimization now (old lots are replaced there), plus the fixed NODES. Lots that are
+    already the new Vyron ones are never «old», so a stopped run continues where it ended."""
+    sections: dict = {}
+    for l in _my_lots(c):
+        node = _node(l)
+        if node is None:
+            continue
+        game = _game(l, node)
+        tier = _tier_of(l.description, game)
+        if tier is None and not _is_optimization(l.description):
+            continue
+        s = sections.setdefault(node, {"game": game, "old": [], "have": set(), "template": l.id})
+        if tier:
+            s["have"].add(tier)
+        else:
+            s["old"].append(l)
+    for node, game in NODES.items():
+        sections.setdefault(node, {"game": game, "old": [], "have": set(), "template": None})
+    return sections
+
+
+_stop = False
+_running = threading.Lock()
+
+
+def _template(c, node: int, template_id):
     """Fields for a new lot in `node`: a copy of one of my lots there (keeps the section's own select fields), else the empty form."""
     from FunPayAPI import types
-    if node in mine:
-        f = c.account.get_lot_fields(mine[node])
+    if template_id:
+        f = c.account.get_lot_fields(template_id)
         fields = dict(f.fields)
         fields["offer_id"] = "0"
         return types.LotFields(0, fields, f.subcategory, f.currency)
     return c.account.get_lot_fields(0, node)
 
 
-def apply(c, report) -> None:
-    path, n = backup(c)
-    report(f"Копия {n} лотов: {path}")
-    delete, create = plan(c)
-    mine = {}
-    for l in _my_lots(c):
-        node = getattr(getattr(l, "subcategory", None), "id", None)
-        if node in NODES and node not in mine:
-            mine[node] = l.id
-    templates = {}
-    for node in NODES:      # take the templates BEFORE deleting anything
-        try:
-            templates[node] = _template(c, node, mine)
-        except Exception as ex:
-            report(f"⚠️ Раздел {node}: форма не получена ({ex}), пропускаю")
-        time.sleep(PAUSE / 2)
-    created = failed = 0
-    for node, game, t in create:
-        if node not in templates:
-            continue
-        lim = _limits(c, node)
-        try:
-            from FunPayAPI import types
-            base = templates[node]
-            lf = types.LotFields(0, dict(base.fields), base.subcategory, base.currency)
-            lf.title_ru = fit_title(t["title_ru"].format(g="ДЛЯ " + (game.upper() if game != "любых игр" else "ЛЮБЫХ ИГР")), lim.get("summary_ru"))
-            lf.title_en = fit_title(t["title_en"].format(g="FOR " + (game.upper() if game != "любых игр" else "ANY GAME")), lim.get("summary_en"))
-            lf.description_ru = fit(blocks_ru(t, game), lim.get("desc_ru"))
-            lf.description_en = fit(blocks_en(t, game), lim.get("desc_en"))
-            lf.payment_msg_ru = fit(["Спасибо за покупку! Пришлите сюда email вашего аккаунта Vyron OS — баланс зачислится автоматически."], lim.get("payment_msg_ru"))
-            lf.payment_msg_en = fit(["Thank you! Send the email of your Vyron OS account here — the balance is added automatically."], lim.get("payment_msg_en"))
-            lf.price = t["price"]
-            lf.active = True
-            if lf.amount is None and not lf.auto_delivery:
-                lf.amount = 999
-            lf.renew_fields()
-            c.account.save_lot(lf)
-            created += 1
-        except Exception as ex:
-            failed += 1
-            report(f"⚠️ Не создан {t['key']} в разделе {node}: {ex}")
-        time.sleep(PAUSE)
-    deleted = 0
-    for l in delete:
-        try:
-            c.account.delete_lot(l.id)
-            deleted += 1
-        except Exception as ex:
-            report(f"⚠️ Лот {l.id} не удалён: {ex}")
-        time.sleep(PAUSE)
-    report(f"Готово: создано {created}, не создано {failed}, удалено старых {deleted}. Копия: {path}")
+def _new_lot(base, t: dict, game: str, lim: dict):
+    from FunPayAPI import types
+    lf = types.LotFields(0, dict(base.fields), base.subcategory, base.currency)
+    lf.title_ru = fit_title(t["title_ru"].format(g=_g_ru(game)), lim.get("summary_ru"))
+    lf.title_en = fit_title(t["title_en"].format(g=_g_en(game)), lim.get("summary_en"))
+    lf.description_ru = fit(blocks_ru(t, game), lim.get("desc_ru"))
+    lf.description_en = fit(blocks_en(t, game), lim.get("desc_en"))
+    lf.payment_msg_ru = fit(["Спасибо за покупку! Пришлите сюда email вашего аккаунта Vyron OS — баланс зачислится автоматически."], lim.get("payment_msg_ru"))
+    lf.payment_msg_en = fit(["Thank you! Send the email of your Vyron OS account here — the balance is added automatically."], lim.get("payment_msg_en"))
+    lf.price = t["price"]
+    lf.active = True
+    if lf.amount is None and not lf.auto_delivery:
+        lf.amount = 999
+    lf.renew_fields()
+    return lf
 
+
+def apply(c, report) -> None:
+    """Section by section: back up its old optimization lots, create the 3 new ones, and only if all 3 were created
+    delete the old ones. A stop (/vyron_lots_stop) ends after the current section; nothing is ever half-replaced."""
+    global _stop
+    _stop = False
+    sections = plan(c)
+    path = _new_backup_path()
+    saved: list = []
+    total = len(sections)
+    created = deleted = skipped = 0
+    report(f"Разделов: {total}, старых лотов к замене: {sum(len(s['old']) for s in sections.values())}. "
+           f"Пишу прогресс каждые 10 разделов. Остановить: /vyron_lots_stop")
+    for i, (node, s) in enumerate(sections.items(), 1):
+        if _stop:
+            report(f"Остановлено после {i - 1} из {total} разделов. Продолжить: /vyron_lots_apply YES")
+            break
+        try:
+            missing = [t for t in TIERS if t["key"] not in s["have"]]
+            ok = 0
+            if missing:
+                base = _template(c, node, s["template"])
+                time.sleep(PAUSE / 2)
+                lim = _limits(c, node)
+                time.sleep(PAUSE / 2)
+                for t in missing:
+                    try:
+                        c.account.save_lot(_new_lot(base, t, s["game"], lim))
+                        ok += 1
+                    except Exception as ex:
+                        report(f"⚠️ {s['game']} [{node}]: {t['key']} не создан ({ex})")
+                    time.sleep(PAUSE)
+            created += ok
+            if ok < len(missing):
+                skipped += 1      # keep the old lots of this section: the new set is incomplete
+                continue
+            for l in s["old"]:
+                try:
+                    saved.append(_backup_entry(c, l))
+                    with open(path, "w", encoding="utf-8") as fh:
+                        json.dump(saved, fh, ensure_ascii=False, indent=1)
+                    time.sleep(PAUSE / 2)
+                    c.account.delete_lot(l.id)
+                    deleted += 1
+                except Exception as ex:
+                    report(f"⚠️ «{l.description}» не удалён ({ex})")
+                time.sleep(PAUSE / 2)
+        except Exception as ex:
+            skipped += 1
+            report(f"⚠️ {s['game']} [{node}]: раздел пропущен ({ex})")
+        if i % 10 == 0:
+            report(f"Готово {i} из {total} разделов: создано {created}, удалено старых {deleted}.")
+    report(f"Готово: создано {created}, удалено старых {deleted}, разделов с ошибкой {skipped}. Копия удалённых: {path}")
 
 def restore(c, report) -> None:
     from FunPayAPI import types
@@ -315,12 +402,20 @@ def restore(c, report) -> None:
     if not files:
         report("Копий нет.")
         return
-    with open(files[-1], "r", encoding="utf-8") as fh:
-        saved = json.load(fh)
-    current = {(l.description or "").strip() for l in _my_lots(c)}
+    saved, seen = [], set()
+    for path in files:          # every run writes its own copy; a lot is restored once even if it is in several
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for s in json.load(fh):
+                    if s.get("id") not in seen:
+                        seen.add(s.get("id"))
+                        saved.append(s)
+        except Exception as ex:
+            report(f"⚠️ копия {path} не прочитана: {ex}")
+    current = {(_node(l), (l.description or "").strip()) for l in _my_lots(c)}
     done = 0
     for s in saved:
-        if (s.get("title") or "").strip() in current:
+        if (s.get("node"), (s.get("title") or "").strip()) in current:
             continue       # still there
         try:
             fields = dict(s["fields"])
@@ -332,7 +427,7 @@ def restore(c, report) -> None:
         except Exception as ex:
             report(f"⚠️ «{s.get('title')}» не восстановлен: {ex}")
         time.sleep(PAUSE)
-    report(f"Восстановлено лотов: {done} из копии {files[-1]}")
+    report(f"Восстановлено лотов: {done} (копий: {len(files)}). Новые лоты Vyron не удалялись.")
 
 
 # ── Telegram ───────────────────────────────────────────────────────────────────────────────────
@@ -346,26 +441,58 @@ def init(c, *args):
         return m.from_user.id in tg.authorized_users
 
     def say(m):
-        return lambda text: bot.send_message(m.chat.id, text[:4000])
+        def send(text: str):
+            for i in range(0, len(text), 4000):
+                try:
+                    bot.send_message(m.chat.id, text[i:i + 4000])
+                except Exception as ex:
+                    logger.warning(f"[vyron_lots] сообщение не отправлено: {ex}")
+        return send
+
+    def background(m, job, busy_text: str):
+        """Long jobs run in their own thread, so the bot keeps answering (and /vyron_lots_stop works)."""
+        if not _running.acquire(blocking=False):
+            bot.send_message(m.chat.id, busy_text)
+            return
+
+        def run():
+            try:
+                job(c, say(m))
+            except Exception as ex:
+                logger.exception("[vyron_lots]")
+                say(m)(f"Ошибка: {ex}")
+            finally:
+                _running.release()
+        threading.Thread(target=run, daemon=True).start()
 
     def cmd_backup(m):
         if not allowed(m):
             return
-        path, n = backup(c)
-        bot.send_message(m.chat.id, f"Сохранено лотов: {n}\n{path}")
+
+        def job(c, report):
+            report("Снимаю копию всех лотов, это долго (около 1,5 с на лот)…")
+            path, n = backup(c)
+            report(f"Сохранено лотов: {n}\n{path}")
+        background(m, job, "Уже идёт другая операция с лотами, дождитесь её конца.")
 
     def cmd_preview(m):
         if not allowed(m):
             return
-        delete, create = plan(c)
-        lines = [f"Будет удалено ({len(delete)}):"] + [f"• {l.description} — {l.price}" for l in delete]
-        lines += ["", f"Будет создано ({len(create)}):"]
-        for node, game, t in create:
-            lines.append(f"• [{node} {game}] {t['key']} — {t['price']} ₽")
-        lim = _limits(c, next(iter(NODES)))
-        lines += ["", f"Лимиты формы (раздел {next(iter(NODES))}): {lim}",
-                  "", "Применить: /vyron_lots_apply YES  (перед этим будет сделана копия всех лотов)"]
-        bot.send_message(m.chat.id, "\n".join(lines)[:4000])
+
+        def job(c, report):
+            sections = plan(c)
+            old = sum(len(s["old"]) for s in sections.values())
+            new = sum(len(TIERS) - len(s["have"]) for s in sections.values())
+            lines = [f"Разделов: {len(sections)}. Старых лотов оптимизации к замене: {old}. Новых лотов будет создано: {new}.", ""]
+            for node, s in sorted(sections.items(), key=lambda x: x[1]["game"]):
+                lines.append(f"• {s['game']} [{node}]: заменить {len(s['old'])}, создать {len(TIERS) - len(s['have'])}")
+            first = next(iter(sections))
+            lines += ["", f"Лимиты формы (раздел {first}): {_limits(c, first)}",
+                      f"Примерное время: ~{max(1, round(len(sections) * 16 / 60 + old * 3 / 60))} мин.",
+                      "Лоты, которых нет в списке выше (не про оптимизацию, и лот за 97 ₽), не трогаются.",
+                      "", "Применить: /vyron_lots_apply YES"]
+            report("\n".join(lines))
+        background(m, job, "Уже идёт другая операция с лотами, дождитесь её конца.")
 
     def cmd_apply(m):
         if not allowed(m):
@@ -373,29 +500,36 @@ def init(c, *args):
         if "YES" not in (m.text or "").upper().split():
             bot.send_message(m.chat.id, "Чтобы применить, отправьте: /vyron_lots_apply YES")
             return
-        bot.send_message(m.chat.id, "Начинаю: копия → новые лоты → удаление старых. Это займёт несколько минут.")
-        try:
-            apply(c, say(m))
-        except Exception as ex:
-            bot.send_message(m.chat.id, f"Ошибка: {ex}")
+        bot.send_message(m.chat.id, "Начинаю по разделам: 3 новых лота → копия старых → удаление старых. "
+                                    "Остановить: /vyron_lots_stop")
+        background(m, apply, "Замена уже идёт. Остановить: /vyron_lots_stop")
+
+    def cmd_stop(m):
+        global _stop
+        if not allowed(m):
+            return
+        if not _running.locked():
+            bot.send_message(m.chat.id, "Сейчас ничего не выполняется.")
+            return
+        _stop = True
+        bot.send_message(m.chat.id, "Остановлю после текущего раздела (наполовину раздел не останется).")
 
     def cmd_restore(m):
         if not allowed(m):
             return
-        try:
-            restore(c, say(m))
-        except Exception as ex:
-            bot.send_message(m.chat.id, f"Ошибка: {ex}")
+        background(m, restore, "Уже идёт другая операция с лотами, дождитесь её конца.")
 
     tg.msg_handler(cmd_backup, commands=["vyron_lots_backup"])
     tg.msg_handler(cmd_preview, commands=["vyron_lots_preview"])
     tg.msg_handler(cmd_apply, commands=["vyron_lots_apply"])
+    tg.msg_handler(cmd_stop, commands=["vyron_lots_stop"])
     tg.msg_handler(cmd_restore, commands=["vyron_lots_restore"])
     c.add_telegram_commands(UUID, [
         ("vyron_lots_backup", "Vyron: копия всех лотов", True),
-        ("vyron_lots_preview", "Vyron: что удалится и создастся", True),
-        ("vyron_lots_apply", "Vyron: выставить лоты (YES)", True),
-        ("vyron_lots_restore", "Vyron: вернуть лоты из копии", True),
+        ("vyron_lots_preview", "Vyron: где лоты будут заменены", True),
+        ("vyron_lots_apply", "Vyron: заменить лоты (YES)", True),
+        ("vyron_lots_stop", "Vyron: остановить замену", True),
+        ("vyron_lots_restore", "Vyron: вернуть старые лоты", True),
     ])
 
 
