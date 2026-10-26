@@ -24,7 +24,7 @@ import time
 from logging import getLogger
 
 NAME = "Vyron OS Lots"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 DESCRIPTION = "Выставляет лоты Vyron OS во все разделы оптимизации FunPay (с копией и откатом)."
 CREDITS = "Vyron OS"
 UUID = "8b2e5d71-4c9a-4f36-b1d2-7e0a9c3f6a18"
@@ -151,34 +151,41 @@ def blocks_en(t: dict, game: str) -> list:
     return out
 
 
-def fit(blocks: list, limit: int | None, sep: str = "\n\n") -> str:
+def fit(blocks: list, limit: int | None, sep: str = "\n\n", max_lines: int | None = None) -> str:
     """Picks blocks by priority (an item may be (priority, block); plain items get their position) and prints the picked
     ones in their original order, so a short limit keeps «how to get it» and drops the extras, never cutting mid-sentence.
-    A block that is a list adds its lines one by one (its first line is a header). The first block is always kept."""
+    A block that is a list adds its lines one by one (its first line is a header). The first block is always kept.
+    `max_lines` caps the line count too (FunPay rejects a description with «Слишком много строк»)."""
     items = [(b[0], i, b[1]) if isinstance(b, tuple) else (10 + i, i, b) for i, b in enumerate(blocks)]
     chosen: dict[int, str] = {}
+    if max_lines is not None:
+        sep = "\n"       # empty lines between blocks would spend the line budget on nothing
 
     def render(extra: dict | None = None) -> str:
         d = dict(chosen)
         d.update(extra or {})
         return sep.join(d[k] for k in sorted(d))
 
+    def fits(s: str) -> bool:
+        return (limit is None or len(s) <= limit) and (max_lines is None or s.count("\n") + 1 <= max_lines)
+
     for prio, idx, b in sorted(items, key=lambda x: (x[0], x[1])):
         if isinstance(b, list):
             part = ""
             for j, line in enumerate(b):
                 cand = line if not part else part + "\n" + line
-                if limit is None or len(render({idx: cand})) <= limit:
+                if fits(render({idx: cand})):
                     part = cand
                 elif j == 0:
                     break
             if part and part != b[0]:
                 chosen[idx] = part
             continue
-        if limit is None or len(render({idx: b})) <= limit:
+        if fits(render({idx: b})):
             chosen[idx] = b
         elif not chosen:
-            return b[: max(0, limit - 1)].rsplit(" ", 1)[0] + "…"
+            s = b.split("\n")[0]
+            return s if limit is None or len(s) <= limit else s[: max(0, limit - 1)].rsplit(" ", 1)[0] + "…"
     return render()
 
 def fit_title(text: str, limit: int | None) -> str:
@@ -223,6 +230,20 @@ def _storage(name: str) -> str:
     d = os.path.join("storage", "plugins")
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, name)
+
+
+def _err(ex: Exception) -> str:
+    """FunPay's own reason in one line (FunPayAPI's str() of a request error dumps the whole request body)."""
+    msg = getattr(ex, "error_message", None)
+    errors = getattr(ex, "errors", None)
+    parts = [str(msg)] if msg else []
+    if errors:
+        parts.append("; ".join(f"{k}: {v}" for k, v in (errors.items() if isinstance(errors, dict) else enumerate(errors))))
+    if not parts:
+        resp = getattr(ex, "response", None)
+        text = getattr(resp, "text", None)
+        parts.append(text[:300] if text else str(ex).split("\n")[0][:200])
+    return " | ".join(parts)
 
 
 def _new_backup_path() -> str:
@@ -326,13 +347,58 @@ def _template(c, node: int, template_id):
     return c.account.get_lot_fields(0, node)
 
 
+# Limits FunPay does not put in the form but enforces on save; known ones are preset, the rest are learned from
+# its errors («Слишком длинный текст», «Слишком много строк») during a run and kept for every next lot.
+LEARNED: dict = {"summary_ru": 100, "summary_en": 100}
+
+
+def _min(a, b):
+    return b if a is None else a if b is None else min(a, b)
+
+
+def _lines(s: str) -> int:
+    return s.count("\n") + 1
+
+
+def _learn(ex, lf) -> bool:
+    """Tightens LEARNED from a FunPay save error. True if something changed (worth retrying the lot)."""
+    errors = getattr(ex, "errors", None)
+    if isinstance(errors, dict):
+        errors = list(errors.items())
+    changed = False
+    for item in errors or []:
+        try:
+            field, msg = item[0], str(item[1]).lower()
+        except Exception:
+            continue
+        m = re.match(r"fields\[(summary|desc|payment_msg)\]\[(ru|en)\]", str(field))
+        if not m:
+            continue
+        kind, lang = m.groups()
+        value = {"summary": getattr(lf, "title_" + lang, None), "desc": getattr(lf, "description_" + lang, None),
+                 "payment_msg": getattr(lf, "payment_msg_" + lang, None)}[kind] or ""
+        if "строк" in msg and kind != "summary":
+            new = max(3, _lines(value) - 3)
+            if new < (LEARNED.get(f"lines_{kind}_{lang}") or 10 ** 6):
+                LEARNED[f"lines_{kind}_{lang}"] = new
+                changed = True
+        elif "длин" in msg:
+            step = 1 if kind == "summary" else max(50, len(value) // 10)
+            new = max(10, len(value) - step)
+            if new < (LEARNED.get(f"{kind}_{lang}") or 10 ** 6):
+                LEARNED[f"{kind}_{lang}"] = new
+                changed = True
+    return changed
+
+
 def _new_lot(base, t: dict, game: str, lim: dict):
     from FunPayAPI import types
+    lim = {k: _min(lim.get(k), LEARNED.get(k)) for k in set(lim) | set(LEARNED)}
     lf = types.LotFields(0, dict(base.fields), base.subcategory, base.currency)
     lf.title_ru = fit_title(t["title_ru"].format(g=_g_ru(game)), lim.get("summary_ru"))
     lf.title_en = fit_title(t["title_en"].format(g=_g_en(game)), lim.get("summary_en"))
-    lf.description_ru = fit(blocks_ru(t, game), lim.get("desc_ru"))
-    lf.description_en = fit(blocks_en(t, game), lim.get("desc_en"))
+    lf.description_ru = fit(blocks_ru(t, game), lim.get("desc_ru"), max_lines=lim.get("lines_desc_ru"))
+    lf.description_en = fit(blocks_en(t, game), lim.get("desc_en"), max_lines=lim.get("lines_desc_en"))
     lf.payment_msg_ru = fit(["Спасибо за покупку! Пришлите сюда email вашего аккаунта Vyron OS — баланс зачислится автоматически."], lim.get("payment_msg_ru"))
     lf.payment_msg_en = fit(["Thank you! Send the email of your Vyron OS account here — the balance is added automatically."], lim.get("payment_msg_en"))
     lf.price = t["price"]
@@ -352,7 +418,7 @@ def apply(c, report) -> None:
     path = _new_backup_path()
     saved: list = []
     total = len(sections)
-    created = deleted = skipped = 0
+    created = deleted = skipped = failed_in_row = 0
     report(f"Разделов: {total}, старых лотов к замене: {sum(len(s['old']) for s in sections.values())}. "
            f"Пишу прогресс каждые 10 разделов. Остановить: /vyron_lots_stop")
     for i, (node, s) in enumerate(sections.items(), 1):
@@ -368,16 +434,30 @@ def apply(c, report) -> None:
                 lim = _limits(c, node)
                 time.sleep(PAUSE / 2)
                 for t in missing:
-                    try:
-                        c.account.save_lot(_new_lot(base, t, s["game"], lim))
-                        ok += 1
-                    except Exception as ex:
-                        report(f"⚠️ {s['game']} [{node}]: {t['key']} не создан ({ex})")
+                    for attempt in range(12):
+                        lf = _new_lot(base, t, s["game"], lim)
+                        try:
+                            c.account.save_lot(lf)
+                            ok += 1
+                            break
+                        except Exception as ex:
+                            logger.warning(f"[vyron_lots] {node} {t['key']}: {ex}")
+                            if _learn(ex, lf):
+                                time.sleep(PAUSE)
+                                continue      # FunPay told what is too long: shorten and try again
+                            report(f"⚠️ {s['game']} [{node}]: {t['key']} не создан: {_err(ex)}")
+                            break
                     time.sleep(PAUSE)
             created += ok
             if ok < len(missing):
                 skipped += 1      # keep the old lots of this section: the new set is incomplete
+                failed_in_row = failed_in_row + 1 if ok == 0 else 0
+                if failed_in_row >= 3:
+                    report("⛔ В 3 разделах подряд не создан ни один лот, остановился. Старые лоты в них не тронуты. "
+                           "Пришлите эти ошибки разработчику.")
+                    break
                 continue
+            failed_in_row = 0
             for l in s["old"]:
                 try:
                     saved.append(_backup_entry(c, l))
@@ -387,14 +467,15 @@ def apply(c, report) -> None:
                     c.account.delete_lot(l.id)
                     deleted += 1
                 except Exception as ex:
-                    report(f"⚠️ «{l.description}» не удалён ({ex})")
+                    report(f"⚠️ «{l.description}» не удалён: {_err(ex)}")
                 time.sleep(PAUSE / 2)
         except Exception as ex:
             skipped += 1
-            report(f"⚠️ {s['game']} [{node}]: раздел пропущен ({ex})")
+            report(f"⚠️ {s['game']} [{node}]: раздел пропущен: {_err(ex)}")
         if i % 10 == 0:
             report(f"Готово {i} из {total} разделов: создано {created}, удалено старых {deleted}.")
-    report(f"Готово: создано {created}, удалено старых {deleted}, разделов с ошибкой {skipped}. Копия удалённых: {path}")
+    report(f"Готово: создано {created}, удалено старых {deleted}, разделов с ошибкой {skipped}. Копия удалённых: {path}\n"
+           f"Лимиты FunPay: {LEARNED}")
 
 def restore(c, report) -> None:
     from FunPayAPI import types
@@ -425,7 +506,7 @@ def restore(c, report) -> None:
             c.account.save_lot(types.LotFields(0, fields))
             done += 1
         except Exception as ex:
-            report(f"⚠️ «{s.get('title')}» не восстановлен: {ex}")
+            report(f"⚠️ «{s.get('title')}» не восстановлен: {_err(ex)}")
         time.sleep(PAUSE)
     report(f"Восстановлено лотов: {done} (копий: {len(files)}). Новые лоты Vyron не удалялись.")
 
@@ -460,7 +541,7 @@ def init(c, *args):
                 job(c, say(m))
             except Exception as ex:
                 logger.exception("[vyron_lots]")
-                say(m)(f"Ошибка: {ex}")
+                say(m)(f"Ошибка: {_err(ex)}")
             finally:
                 _running.release()
         threading.Thread(target=run, daemon=True).start()
