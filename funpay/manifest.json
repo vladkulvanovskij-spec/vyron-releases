@@ -1,0 +1,17 @@
+{
+    "updated":  "2026-10-26T11:56:56Z",
+    "files":  {
+                  "vyron_topup.py":  {
+                                         "version":  "1.0.0",
+                                         "sha256":  "a71adb5c257195cc676ea6bb487b9b5245ea58500f42a7d4d3652a0e854d61ee"
+                                     },
+                  "vyron_lots.py":  {
+                                        "version":  "1.0.0",
+                                        "sha256":  "968815c165651fa5cb20a498eea74e007991e065dfc87d247dcf5fef5a5a09bb"
+                                    },
+                  "vyron_assistant.py":  {
+                                             "version":  "1.1.0",
+                                             "sha256":  "837378dff3df8213f69bc1b02e03feb363224876931fb2f5bfabf28c29a7f604"
+                                         }
+              }
+}
