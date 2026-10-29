@@ -23,11 +23,12 @@ import re
 import threading
 import time
 from logging import getLogger
+from types import SimpleNamespace
 
 import requests
 
 NAME = "Vyron OS"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 DESCRIPTION = "Vyron OS: пополнение баланса, ИИ-консультант, лоты и автообновление. Меню: /vyron"
 CREDITS = "Vyron OS"
 UUID = "5d0b8a3e-2f4c-4e71-a9b6-c38e1f7d2a90"
@@ -168,9 +169,24 @@ TOPUP_LOTS = {
 TOPUP_MAX_TRIES = 3
 TOPUP_STATE = os.path.join("storage", "plugins", "vyron_topup.json")
 
-T_ASK = ("Спасибо за покупку! Чтобы зачислить баланс в Vyron OS, пришлите сюда одним сообщением "
+# Одно сообщение после оплаты: оно же приветствие (приветствие Кардинала в этот чат плагин гасит, см. _quiet_greeting).
+T_ASK = ("Здравствуйте! Спасибо за покупку! Чтобы зачислить баланс в Vyron OS, пришлите сюда одним сообщением "
          "email, с которым вы вошли в приложение или на сайт " + SITE + ". "
-         "Если аккаунта ещё нет, зарегистрируйтесь там и пришлите email.")
+         "Если аккаунта ещё нет, зарегистрируйтесь там и пришлите email. Вопросы тоже можно писать сюда.")
+T_NO_ORDER = ("🙋 {buyer} прислал email {email}, но оплаченного заказа Vyron в этом чате плагин не ждёт. "
+              "Если он оплатил: /vyron_credit НОМЕР_ЗАКАЗА {email} СУММА_$ (4.99 / 29.99 / 69.99)")
+# «Покупатель X оплатил заказ #ABCD1234. Игра, раздел, название лота…» — системное сообщение FunPay
+PURCHASE_RE = re.compile(r"(Покупатель|The buyer) \S+ (оплатил заказ|has paid for order) #([A-Z0-9]{8})")
+# «Сообщение покупателю после оплаты» лотов Vyron (см. _new_lot): FunPay шлёт его от имени продавца с пометкой «автоответ»
+AUTO_REPLY_RE = re.compile(r"email (вашего )?(аккаунта )?Vyron|email of your Vyron", re.I)
+EMAIL_ASK_RE = re.compile(r"e-?mail|почт", re.I)
+ASK_DELAY_SEC = 8
+_auto_seen: dict[str, float] = {}     # buyer nickname → when the lot's auto-reply showed up in the chat
+
+
+def _is_auto_reply(m) -> bool:
+    """FunPay's own message in the seller's name (marked «автоответ»), not the seller typing by hand."""
+    return getattr(m, "badge", None) is not None or bool(AUTO_REPLY_RE.search(m.text or ""))
 T_DONE = ("Готово: на баланс {email} зачислено ${amount}. Откройте Vyron OS → Подписка и купите тариф. "
           "Если что-то не так, напишите сюда.")
 T_ALREADY = "Этот заказ уже зачислен на {email}. Баланс виден в Vyron OS и на сайте."
@@ -188,7 +204,7 @@ def _top_load() -> dict:
             s = json.load(f)
     except Exception:
         s = {}
-    for k in ("pending", "done", "manual"):
+    for k in ("pending", "done", "manual", "legacy"):
         s.setdefault(k, {})
     return s
 
@@ -246,19 +262,40 @@ def _top_on_order(c, e):
         if order.id in state["done"] or order.id in state["pending"]:
             return
         state["pending"][order.id] = {"chat_id": order.chat_id, "buyer": order.buyer_username, "buyer_id": order.buyer_id,
-                                      "amount": amount, "tries": 0, "email": None, "at": int(time.time())}
+                                      "amount": amount, "tries": 0, "email": None, "at": int(time.time()), "v": 2}
         _top_save(state)
-    c.send_message(order.chat_id, T_ASK, order.buyer_username)
+    threading.Thread(target=_ask_email, args=(c, order), daemon=True).start()
     logger.info(f"[vyron] заказ #{order.id}: жду email от {order.buyer_username} (${amount})")
 
 
-def _finish(c, order_id: str, p: dict, email: str):
+def _ask_email(c, order):
+    """T_ASK, unless the lot's own «message after payment» (FunPay sends it as «автоответ»; the Vyron lots ask for the
+    email there) is already in the chat: then the buyer would get the same request twice."""
+    time.sleep(ASK_DELAY_SEC)          # FunPay posts that message the same second as the payment
+    if time.time() - _auto_seen.get(str(order.buyer_username).lower(), 0) < 600:
+        return
+    try:
+        history = c.account.get_chat_history(order.chat_id, interlocutor_username=order.buyer_username)
+    except Exception as ex:
+        logger.warning(f"[vyron] история чата заказа #{order.id} не прочитана: {ex}")
+        history = []
+    after = False
+    for msg in history:
+        if getattr(msg, "author_id", None) == 0 and f"#{order.id}" in (msg.text or ""):
+            after = True
+        elif after and getattr(msg, "author_id", None) == c.account.id and not getattr(msg, "by_bot", False) \
+                and EMAIL_ASK_RE.search(msg.text or ""):
+            return                     # the email was asked for already, by the lot or by hand
+    c.send_message(order.chat_id, T_ASK, order.buyer_username)
+
+
+def _finish(c, order_id: str, p: dict, email: str) -> str:
     status, body = _credit(order_id, email, p["amount"], p["buyer"])
     with _top_lock:
         state = _top_load()
         cur = state["pending"].get(order_id)
         if cur is None:
-            return
+            return status
         if status in ("ok", "already"):
             state["pending"].pop(order_id, None)
             state["done"][order_id] = {"email": email, "amount": p["amount"], "buyer": p["buyer"], "at": int(time.time())}
@@ -284,13 +321,25 @@ def _finish(c, order_id: str, p: dict, email: str):
             state["manual"][order_id] = cur
             _top_save(state)
             text = T_GIVE_UP
-    if text:
-        c.send_message(p["chat_id"], text, p["buyer"])
+    if text and (p.get("node") or p.get("chat_id")):
+        c.send_message(p.get("node") or p["chat_id"], text, p["buyer"])
     if status == "ok":
         _notify(c, f"💰 Заказ #{order_id}: ${p['amount']} зачислено на {email} ({p['buyer']}).")
     elif text == T_GIVE_UP:
         _notify(c, f"🙋 Заказ #{order_id} ({p['buyer']}): баланс не зачислен, нужна ручная помощь. Меню: /vyron → Пополнения.")
     logger.info(f"[vyron] заказ #{order_id}: {status} ({email})")
+    return status
+
+
+def _same_chat(p: dict, m) -> bool:
+    """Is message `m` from the buyer of pending order `p`? An order knows its chat as «users-1-2», a message as the
+    number 123456, so the buyer's id and nickname decide (the bug of 2.0.0: emails were never matched)."""
+    if str(p.get("chat_id")) == str(m.chat_id) or (p.get("node") is not None and str(p["node"]) == str(m.chat_id)):
+        return True
+    if p.get("buyer_id") and str(p["buyer_id"]) == str(getattr(m, "author_id", None)):
+        return True
+    name = str(getattr(m, "chat_name", "") or "").lower()
+    return bool(name) and name == str(p.get("buyer") or "").lower()
 
 
 def _top_on_message(c, m) -> bool:
@@ -298,17 +347,71 @@ def _top_on_message(c, m) -> bool:
     found = EMAIL_RE.search(m.text or "")
     if not found:
         return False
+    email = found.group(0).lower()
     with _top_lock:
         state = _top_load()
-        hits = [(k, v) for k, v in state["pending"].items() if str(v["chat_id"]) == str(m.chat_id) and v.get("email") is None]
-        if not hits:
-            return False
-        order_id, p = sorted(hits, key=lambda kv: kv[1]["at"])[0]
-    threading.Thread(target=_finish, args=(c, order_id, p, found.group(0).lower()), daemon=True).start()
+        hits = [(k, v) for k, v in state["pending"].items() if _same_chat(v, m) and v.get("email") is None]
+        busy = any(_same_chat(v, m) for v in state["pending"].values())
+        known = busy or any(_same_chat(v, m) for v in state["done"].values())
+        if hits:
+            order_id, p = sorted(hits, key=lambda kv: kv[1]["at"])[0]
+            if isinstance(m.chat_id, int):
+                p["node"] = m.chat_id      # the numeric chat id: replies and the chat-history check use it
+                _top_save(state)
+    if not hits:
+        if not known:
+            _notify(c, T_NO_ORDER.format(buyer=m.chat_name or m.chat_id, email=email))
+        return busy       # an email for an order already being credited needs no AI answer either
+    threading.Thread(target=_finish, args=(c, order_id, p, email), daemon=True).start()
     return True
 
 
+def _recover_emails(c) -> None:
+    """Finds emails that buyers already sent to the chat of a waiting order but the plugin missed (2.0.0 never matched
+    them, or Cardinal was offline), and credits them. Reads the chat history of each waiting order once in a while."""
+    with _top_lock:
+        waiting = [(k, dict(v)) for k, v in _top_load()["pending"].items()
+                   if v.get("v") and v.get("email") is None and time.time() - v.get("at", 0) < 7 * 86400]
+    for order_id, p in waiting:
+        try:
+            history = c.account.get_chat_history(p.get("node") or p["chat_id"], interlocutor_username=p["buyer"])
+        except Exception as ex:
+            logger.warning(f"[vyron] история чата заказа #{order_id} не прочитана: {ex}")
+            continue
+        start = 0     # only what the buyer wrote after this order was paid, when that message is still in the history
+        for i, msg in enumerate(history):
+            if getattr(msg, "author_id", None) == 0 and f"#{order_id}" in (msg.text or ""):
+                start = i + 1
+        buyer = p.get("buyer_id")      # only the buyer of this very order, never someone else's address
+        emails = [EMAIL_RE.search(msg.text or "") for msg in history[start:]
+                  if not getattr(msg, "by_bot", False) and getattr(msg, "author_id", None) not in (0, c.account.id)
+                  and (buyer is None or getattr(msg, "author_id", None) == buyer)]
+        emails = [e.group(0).lower() for e in emails if e]
+        if emails:
+            logger.info(f"[vyron] заказ #{order_id}: email из истории чата {emails[-1]}")
+            _finish(c, order_id, p, emails[-1])
+        time.sleep(2)
+
+
+def _top_migrate(c) -> None:
+    """2.0.0 never matched the buyers' emails, so the seller handled its waiting orders by hand (#ZXWQ95JQ got a
+    subscription directly). They are set aside, never credited from the chat history, and the seller sees the list once."""
+    with _top_lock:
+        state = _top_load()
+        old = {k: v for k, v in state["pending"].items() if not v.get("v") and not v.get("email")}
+        if not old:
+            return
+        state["legacy"].update(old)
+        for k in old:
+            state["pending"].pop(k)
+        _top_save(state)
+    _notify(c, "Vyron 2.0.1: старая версия не узнавала email покупателей. Эти заказы не зачислены и сами зачисляться "
+               "не будут:\n" + "\n".join(f"• #{k} {v.get('buyer')} ${v.get('amount')}" for k, v in old.items()) +
+               "\nЕсли кто-то из них ещё ждёт баланс: /vyron_credit НОМЕР_ЗАКАЗА EMAIL")
+
+
 def _topup_retry_loop(c):
+    n = 0
     while True:
         time.sleep(120)
         try:
@@ -316,25 +419,37 @@ def _topup_retry_loop(c):
                 waiting = [(k, dict(v)) for k, v in _top_load()["pending"].items() if v.get("email")]
             for order_id, p in waiting:
                 _finish(c, order_id, p, p["email"])
+            if n % 10 == 0:          # the first time 2 minutes after start, then every 20 minutes
+                _recover_emails(c)
         except Exception as ex:
             logger.warning(f"[vyron] повтор зачисления не удался: {ex}")
+        n += 1
 
 
-def topup_manual(c, order_id: str, email: str) -> str:
-    """Seller's «credit by hand» for an order in the manual list."""
+def topup_manual(c, order_id: str, email: str, amount: float | None = None) -> str:
+    """Seller's «credit by hand»: an order the plugin knows (waiting for an email or needing help), or any order
+    when the amount is given (the site accepts only the tariff amounts and credits one order once)."""
     with _top_lock:
         state = _top_load()
-        p = state["manual"].pop(order_id, None)
+        p = state["manual"].pop(order_id, None) or state["pending"].pop(order_id, None) or state["legacy"].pop(order_id, None)
         if p is None:
-            return f"Заказа #{order_id} нет в списке «нужна помощь»."
+            if order_id in state["done"]:
+                d = state["done"][order_id]
+                return f"Заказ #{order_id} уже зачислен: ${d.get('amount')} на {d.get('email')}."
+            if amount is None:
+                return (f"Заказа #{order_id} плагин не знает. Укажите сумму: "
+                        f"/vyron_credit {order_id} {email} 4.99 (или 29.99 / 69.99).")
+            p = {"chat_id": None, "buyer": "", "buyer_id": None, "amount": amount, "at": int(time.time())}
         p["tries"], p["email"] = 0, None
         state["pending"][order_id] = p
         _top_save(state)
-    _finish(c, order_id, p, email.lower())
-    st = _top_load()
-    if order_id in st["done"]:
-        return f"Заказ #{order_id}: зачислено ${p['amount']} на {email}."
-    return f"Заказ #{order_id}: не зачислено, см. сообщения выше."
+    status = _finish(c, order_id, p, email.lower())
+    return f"Заказ #{order_id}: " + {
+        "ok": f"зачислено ${p['amount']} на {email}.",
+        "already": "уже был зачислен раньше.",
+        "no_user": f"аккаунта {email} на сайте нет, проверьте адрес.",
+        "retry": "сайт не ответил, плагин повторит сам через пару минут.",
+    }.get(status, "сайт отказал, причина в логе Кардинала ([vyron]).")
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -342,14 +457,18 @@ def topup_manual(c, order_id: str, email: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 AI_PROVIDERS = {
     "openrouter": {"base": "https://openrouter.ai/api/v1",
-                   # пробуются по очереди: бесплатные модели иногда перегружены или исчезают
-                   "models": ["google/gemma-4-31b-it:free", "nvidia/nemotron-3-super-120b-a12b:free", "google/gemma-4-26b-a4b-it:free"]},
+                   # пробуются по очереди: бесплатные модели иногда перегружены или исчезают;
+                   # openrouter/free — роутер OpenRouter, сам берёт любую доступную бесплатную модель
+                   "models": ["google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free", "openrouter/free"]},
     "ollama": {"base": "http://localhost:11434/v1", "models": ["qwen2.5:7b"]},
 }
 HUMAN_PAUSE_MIN = 30            # не вмешиваться, если продавец сам писал в чате за последние N минут
 MAX_REPLIES_PER_DAY = 20        # ответов ИИ в одном чате за сутки
 HISTORY = 12                    # сколько последних сообщений чата помнить
+DEBOUNCE_SEC = 4                # покупатель пишет несколькими сообщениями подряд: ответ один, на все сразу
 HANDOFF = "[ПЕРЕДАТЬ]"
+T_HOLD = "Продавец скоро ответит вам здесь лично."
+_ai_error = {"text": "", "at": 0}   # last reason the AI gave no answer, shown in /vyron → ИИ-консультант
 AI_STATE = os.path.join("storage", "plugins", "vyron_assistant.json")
 SYSTEM = f"""Ты консультант продавца Vyron OS на маркетплейсе FunPay. Отвечаешь покупателям в чате продавца.
 
@@ -422,37 +541,59 @@ def _ai_save(s: dict) -> None:
     os.replace(tmp, AI_STATE)
 
 
+AI_HINTS = {
+    401: "ключ OpenRouter неверный или удалён: создайте новый на openrouter.ai/keys и отправьте /vyron_key КЛЮЧ",
+    402: "OpenRouter просит пополнить счёт (отрицательный баланс)",
+    429: "бесплатный лимит OpenRouter на сегодня исчерпан или модели перегружены "
+         "(без пополнения — 50 запросов в сутки, после пополнения на $10 — 1000)",
+}
+
+
+def _ai_fail(reason: str) -> None:
+    _ai_error.update(text=reason, at=time.time())
+    logger.warning(f"[vyron] ИИ не ответил: {reason}")
+
+
 def _ask(history: list[dict]) -> str | None:
-    """history: [{"role": "user"|"assistant", "content": str}], last one from the buyer. OpenAI-compatible chat API."""
+    """history: [{"role": "user"|"assistant", "content": str}], last one from the buyer. OpenAI-compatible chat API.
+    None when no model answered; the reason is kept in _ai_error."""
     prov = ai_provider()
     p = AI_PROVIDERS[prov]
     headers = {"Content-Type": "application/json"}
     if prov == "openrouter":
         key = _config().get("OPENROUTER_API_KEY", "")
         if not key:
-            logger.error("[vyron] ключ OpenRouter не задан: /vyron_key <ключ>")
+            _ai_fail("ключ OpenRouter не задан: /vyron_key КЛЮЧ")
             return None
         headers.update({"Authorization": "Bearer " + key, "X-Title": "Vyron OS FunPay"})
+    errors, codes = [], set()
     for model in p["models"]:
         try:
-            r = requests.post(p["base"] + "/chat/completions", headers=headers, timeout=60, json={
+            r = requests.post(p["base"] + "/chat/completions", headers=headers, timeout=45, json={
                 "model": model, "max_tokens": 600, "temperature": 0.4,
                 "messages": [{"role": "system", "content": SYSTEM}] + history,
             })
         except Exception as ex:
-            logger.warning(f"[vyron] {model}: нет связи ({ex})")
+            errors.append(f"{model}: нет связи ({type(ex).__name__})")
             continue
         if r.status_code != 200:
-            logger.warning(f"[vyron] {model}: {r.status_code} {r.text[:200]}")
+            codes.add(r.status_code)
+            errors.append(f"{model}: {r.status_code} {r.text[:120]}")
+            if r.status_code == 401:
+                break         # a bad key fails every model the same way
             continue      # overloaded / rate limited / removed: try the next free model
         try:
             text = (r.json()["choices"][0]["message"].get("content") or "").strip()
         except Exception:
+            errors.append(f"{model}: непонятный ответ {r.text[:120]}")
             continue
-        # some free models think out loud in <think> tags: never send that to a buyer
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+        # some free models think out loud in <think> tags: never send that to a buyer (an unclosed one is cut off)
+        text = re.sub(r"<think>.*?(</think>|$)", "", text, flags=re.S).strip()
         if text:
             return text
+        errors.append(f"{model}: пустой ответ")
+    hint = next((AI_HINTS[k] for k in (401, 402, 429) if k in codes), "")
+    _ai_fail((hint + ". " if hint else "") + "; ".join(errors)[:600])
     return None
 
 
@@ -471,26 +612,41 @@ def _ai_on_message(c, m):
         s = _ai_load()
         st = s["chats"].setdefault(chat, {"h": [], "human": 0, "day": "", "n": 0})
         if m.author_id == c.account.id:
-            # the seller wrote by hand: remember it and step back for HUMAN_PAUSE_MIN
-            st["human"] = now
+            # the seller wrote by hand: remember it and step back for HUMAN_PAUSE_MIN. The lot's «автоответ» after
+            # payment is in the seller's name too, but it is not the seller (2.0.0 went silent for 30 min after it).
+            if not _is_auto_reply(m):
+                st["human"] = now
             st["h"] = (st["h"] + [{"role": "assistant", "content": text}])[-HISTORY:]
             _ai_save(s)
             return
-        if not text or EMAIL_RE.search(text):
-            return            # empty, or an email for the top-up
+        if not text:
+            return            # a picture
         st["h"] = (st["h"] + [{"role": "user", "content": text}])[-HISTORY:]
-        today = time.strftime("%Y-%m-%d")
-        if st["day"] != today:
-            st["day"], st["n"] = today, 0
-        busy = now - st["human"] < HUMAN_PAUSE_MIN * 60 or st["n"] >= MAX_REPLIES_PER_DAY
+        st["seq"] = st.get("seq", 0) + 1
         _ai_save(s)
+        seq = st["seq"]
+    threading.Thread(target=_answer, args=(c, m, chat, seq), daemon=True).start()
+
+
+def _busy(st: dict) -> bool:
+    """The seller wrote by hand lately, or the AI already answered enough in this chat today."""
+    today = time.strftime("%Y-%m-%d")
+    if st.get("day") != today:
+        st["day"], st["n"] = today, 0
+    return time.time() - st.get("human", 0) < HUMAN_PAUSE_MIN * 60 or st["n"] >= MAX_REPLIES_PER_DAY
+
+
+def _answer(c, m, chat: str, seq: int):
+    time.sleep(DEBOUNCE_SEC)
+    with _ai_lock:
+        s = _ai_load()
+        st = s["chats"].setdefault(chat, {"h": [], "human": 0, "day": "", "n": 0})
+        busy = _busy(st)
+        _ai_save(s)
+        if st.get("seq") != seq or busy:
+            return            # a newer message answers them all, or the seller is here
         history = list(st["h"])
-    if busy:
-        return
-    threading.Thread(target=_answer, args=(c, m, chat, history), daemon=True).start()
-
-
-def _answer(c, m, chat: str, history: list[dict]):
+    started = time.time()
     # the API wants alternating roles starting with the buyer: merge neighbours of the same role
     msgs: list[dict] = []
     for h in history:
@@ -504,21 +660,43 @@ def _answer(c, m, chat: str, history: list[dict]):
         return
     reply = _ask(msgs)
     if not reply:
+        _no_answer(c, m, chat)
         return
     handoff = reply.startswith(HANDOFF)
     reply = reply.replace(HANDOFF, "").strip()[:1500]
     if not reply:
         return
-    c.send_message(m.chat_id, reply, m.chat_name)
     with _ai_lock:
         s = _ai_load()
         st = s["chats"].setdefault(chat, {"h": [], "human": 0, "day": "", "n": 0})
+        if st.get("human", 0) > started or st.get("seq") != seq:
+            return            # the seller answered meanwhile, or the buyer wrote more (that thread answers)
         st["h"] = (st["h"] + [{"role": "assistant", "content": reply}])[-HISTORY:]
-        st["n"] += 1
+        st["n"] = st.get("n", 0) + 1
         s["answered"] = s.get("answered", 0) + 1
         _ai_save(s)
+    c.send_message(m.chat_id, reply, m.chat_name)
     if handoff:
         _notify(c, f"🙋 Покупатель {m.chat_name or chat} ждёт продавца:\n{(m.text or '')[:500]}")
+
+
+def _no_answer(c, m, chat: str):
+    """No model answered: the seller learns why at once, the buyer is told once that a person will answer."""
+    with _ai_lock:
+        s = _ai_load()
+        st = s["chats"].setdefault(chat, {"h": [], "human": 0, "day": "", "n": 0})
+        tell_seller = time.time() - st.get("fail_at", 0) > HUMAN_PAUSE_MIN * 60
+        tell_buyer = time.time() - st.get("hold_at", 0) > 12 * 3600
+        if tell_seller:
+            st["fail_at"] = time.time()
+        if tell_buyer:
+            st["hold_at"] = time.time()
+        _ai_save(s)
+    if tell_buyer:
+        c.send_message(m.chat_id, T_HOLD, m.chat_name)
+    if tell_seller:
+        _notify(c, f"🤖 ИИ не ответил покупателю {m.chat_name or chat}, ответьте сами.\n"
+                   f"Причина: {_ai_error['text'][:700]}\n\nСообщение: {(m.text or '')[:500]}")
 
 
 # ── просьба об отзыве после подтверждения заказа ───────────────────────────────────────────────
@@ -1081,8 +1259,11 @@ def _new_lot(base, t: dict, game: str, lim: dict, price: float | None = None):
     lf.title_en = fit_title(t["title_en"].format(g=_g_en(game)), lim.get("summary_en"))
     lf.description_ru = fit(blocks_ru(t, game), lim.get("desc_ru"), max_lines=lim.get("lines_desc_ru"))
     lf.description_en = fit(blocks_en(t, game), lim.get("desc_en"), max_lines=lim.get("lines_desc_en"))
-    lf.payment_msg_ru = fit(["Спасибо за покупку! Пришлите сюда email вашего аккаунта Vyron OS — баланс зачислится автоматически."], lim.get("payment_msg_ru"))
-    lf.payment_msg_en = fit(["Thank you! Send the email of your Vyron OS account here — the balance is added automatically."], lim.get("payment_msg_en"))
+    # FunPay sends this itself right after payment (the plugin then does not send T_ASK, see _ask_email)
+    lf.payment_msg_ru = fit(["Спасибо за покупку! Пришлите сюда email вашего аккаунта Vyron OS — баланс зачислится автоматически.",
+                             "Нет аккаунта? Зарегистрируйтесь на " + SITE + " и пришлите email."], lim.get("payment_msg_ru"), sep=" ")
+    lf.payment_msg_en = fit(["Thank you! Send the email of your Vyron OS account here — the balance is added automatically.",
+                             "No account? Sign up at " + SITE + " and send the email."], lim.get("payment_msg_en"), sep=" ")
     lf.price = price if price else t["price"]
     lf.active = True
     if lf.amount is None and not lf.auto_delivery:
@@ -1242,11 +1423,57 @@ def on_new_order(c, e, *args):
 def on_new_message(c, e, *args):
     if not _active:
         return
-    m = e.message
+    _on_message(c, e.message)
+
+
+def _on_message(c, m):
     mine = m.by_bot or m.author_id == c.account.id or m.author_id == 0
+    if m.author_id == c.account.id and not m.by_bot and _is_auto_reply(m):
+        _auto_seen[str(m.chat_name).lower()] = time.time()     # the lot asked for the email: T_ASK is not needed
     if not mine and _top_on_message(c, m):
         return            # an email for a paid order: the top-up answers it
     _ai_on_message(c, m)
+
+
+def on_last_chat_message(c, e, *args):
+    """Cardinal's «old message mode» sends no new-message events, only «last message in a chat changed»: without this
+    the plugin never saw the buyer's messages there (no email, no AI). The author is guessed the way Cardinal guesses it."""
+    if not _active or not getattr(c, "old_mode_enabled", False):
+        return
+    ch = e.chat
+    by_bot = bool(getattr(ch, "last_by_bot", False))
+    mtype = getattr(ch, "last_message_type", None)
+    system = mtype is not None and not str(mtype).endswith("NON_SYSTEM")
+    author = 0 if system else c.account.id if by_bot or not ch.unread else -1
+    _on_message(c, SimpleNamespace(text=getattr(ch, "last_message_text", None) or str(ch), chat_id=ch.id,
+                                   chat_name=ch.name, by_bot=by_bot, author_id=author, type=mtype))
+
+
+def _quiet_greeting(c, e, *args):
+    """Runs before Cardinal's greeting handler. A buyer who just paid for a Vyron lot gets one message, the plugin's
+    T_ASK (it greets too), not Cardinal's greeting and T_ASK: the chat is marked «greeted just now»."""
+    if not _active:
+        return
+    m = getattr(e, "message", None)
+    if m is not None:
+        chat_id, name, text = m.chat_id, m.chat_name, m.text or ""
+    else:
+        chat_id, name, text = e.chat.id, e.chat.name, getattr(e.chat, "last_message_text", None) or str(e.chat)
+    if not PURCHASE_RE.search(text):
+        return
+    ours = _amount_for(text) is not None
+    if not ours:      # the order event may already be in: the lot name is known then
+        ours = any(str(p.get("buyer") or "").lower() == str(name or "").lower() for p in _top_load()["pending"].values())
+    if not ours:
+        return
+    users = getattr(c, "old_users", None)
+    if isinstance(users, dict):
+        users[chat_id] = int(time.time())
+    elif isinstance(users, list) and chat_id not in users:
+        users.append(chat_id)
+    seen = getattr(c, "greeting_threshold_chat_ids", None)
+    if isinstance(seen, set):
+        seen.add(chat_id)        # «only new chats» mode treats it as an old chat too
 
 
 def on_order_status(c, e, *args):
@@ -1306,12 +1533,14 @@ def screen_topup(c):
         lines.append("🙋 Нужна ваша помощь (аккаунт не найден или сайт отказал):")
         for oid, p in list(st["manual"].items())[-10:]:
             lines.append(f"• #{oid} {p.get('buyer')} ${p.get('amount')} — {_ago(p.get('at'))}")
-        lines += ["Зачислить вручную: /vyron_credit НОМЕР_ЗАКАЗА EMAIL", ""]
+        lines.append("")
     if st["pending"]:
         lines.append("⏳ Ждут email или повтора:")
         for oid, p in list(st["pending"].items())[-10:]:
             lines.append(f"• #{oid} {p.get('buyer')} ${p.get('amount')} — {_ago(p.get('at'))}" + (f" ({p['email']})" if p.get("email") else ""))
         lines.append("")
+    if st["manual"] or st["pending"]:
+        lines += ["Зачислить вручную: /vyron_credit НОМЕР_ЗАКАЗА EMAIL", ""]
     done = sorted(st["done"].items(), key=lambda kv: kv[1].get("at", 0))[-8:]
     lines.append(f"✅ Зачислено всего: {len(st['done'])} на ${sum(d.get('amount', 0) for d in st['done'].values()):.2f}")
     for oid, d in reversed(done):
@@ -1350,12 +1579,23 @@ def screen_ai(c):
             f"Состояние: {'включён' if ai_enabled() else 'выключен'}\n"
             f"Нейросеть: {'OpenRouter (бесплатные модели)' if prov == 'openrouter' else 'Ollama на этом ПК'}\n"
             + (f"Ключ OpenRouter: {'задан' if key else 'НЕ задан — отправьте /vyron_key КЛЮЧ'}\n" if prov == "openrouter" else "")
-            + f"Ответов всего: {ai.get('answered', 0)}, просьб об отзыве: {len(ai['reviews'])}\n\n"
-            f"Отвечает покупателям в чатах, молчит {HUMAN_PAUSE_MIN} мин после вашего сообщения, "
-            f"не больше {MAX_REPLIES_PER_DAY} ответов в чате за сутки. Сложные вопросы присылает вам сюда.")
+            + f"Ответов всего: {ai.get('answered', 0)}, просьб об отзыве: {len(ai['reviews'])}\n"
+            + (f"⚠️ Последний сбой ({_ago(_ai_error['at'])}): {_ai_error['text'][:500]}\n" if _ai_error["text"] else "")
+            + f"\nОтвечает покупателям в чатах, молчит {HUMAN_PAUSE_MIN} мин после вашего сообщения, "
+            f"не больше {MAX_REPLIES_PER_DAY} ответов в чате за сутки. Сложные вопросы и сбои присылает вам сюда.")
     return text, _kb([[("⏸ Выключить" if ai_enabled() else "▶️ Включить", "ai_toggle"),
                        ("Нейросеть: " + ("→ Ollama" if prov == "openrouter" else "→ OpenRouter"), "ai_provider")],
+                      [("🧪 Проверить нейросеть", "ai_test")],
                       [("⬅️ Назад", "main")]])
+
+
+def ai_test() -> str:
+    """One question to the AI, the way a buyer would ask: its answer or the exact reason it failed."""
+    t = time.time()
+    reply = _ask([{"role": "user", "content": "Здравствуйте, чем отличается PRO от КИБЕРСПОРТ?"}])
+    if reply:
+        return f"✅ Нейросеть отвечает ({time.time() - t:.0f} с):\n\n{reply.replace(HANDOFF, '').strip()[:1500]}"
+    return f"❌ Нейросеть не ответила: {_ai_error['text']}"
 
 
 def screen_updates(c):
@@ -1381,6 +1621,12 @@ def init(c, *args):
                 logger.warning(f"[vyron] не удалён {f}: {ex}")
         _active = False
         logger.info(f"[vyron] старые плагины удалены: {old}")
+    # Cardinal's own handlers run before a plugin's; this one has to run before its greeting
+    _quiet_greeting.plugin_uuid = UUID
+    for name in ("new_message_handlers", "last_chat_message_changed_handlers"):
+        handlers = getattr(c, name, None)
+        if isinstance(handlers, list) and _quiet_greeting not in handlers:
+            handlers.insert(0, _quiet_greeting)
     if tg is None:
         return
     bot = tg.bot
@@ -1452,6 +1698,9 @@ def init(c, *args):
         elif action == "ai_provider":
             _set_config(AI_PROVIDER="ollama" if ai_provider() == "openrouter" else "openrouter")
             show(chat_id, "ai", mid)
+        elif action == "ai_test":
+            bot.send_message(chat_id, "Спрашиваю нейросеть, до минуты…")
+            threading.Thread(target=lambda: send(chat_id)(ai_test()), daemon=True).start()
         elif action == "upd_check":
             bot.send_message(chat_id, update_check(c, notify=False))
         elif action == "lots_apply?":
@@ -1512,10 +1761,19 @@ def init(c, *args):
         parts = (m.text or "").split()
         found = EMAIL_RE.search(m.text or "")
         if len(parts) < 3 or not found:
-            bot.send_message(m.chat.id, "Отправьте так: /vyron_credit НОМЕР_ЗАКАЗА EMAIL")
+            bot.send_message(m.chat.id, "Отправьте так: /vyron_credit НОМЕР_ЗАКАЗА EMAIL [СУММА_$, если плагин не знает заказ]")
             return
-        oid = parts[1].lstrip("#")
-        threading.Thread(target=lambda: send(m.chat.id)(topup_manual(c, oid, found.group(0))), daemon=True).start()
+        oid = parts[1].lstrip("#").upper()
+        amount = None
+        if len(parts) > 3:
+            try:
+                amount = round(float(parts[3].replace(",", ".").lstrip("$")), 2)
+            except ValueError:
+                pass
+            if amount not in set(TOPUP_LOTS.values()):
+                bot.send_message(m.chat.id, "Сумма должна быть одной из: " + ", ".join(sorted({str(v) for v in TOPUP_LOTS.values()})))
+                return
+        threading.Thread(target=lambda: send(m.chat.id)(topup_manual(c, oid, found.group(0), amount)), daemon=True).start()
 
     def cmd_stop(m):
         if allowed(m.from_user.id):
@@ -1544,6 +1802,10 @@ def post_start(c, *args):
         _notify(c, "Vyron: старые плагины (пополнение, лоты, консультант, апдейтер) объединены в один. "
                    "Отправьте /restart один раз, потом меню: /vyron")
         return
+    try:
+        _top_migrate(c)
+    except Exception as ex:
+        logger.warning(f"[vyron] старые заказы не перенесены: {ex}")
     threading.Thread(target=_topup_retry_loop, args=(c,), daemon=True).start()
     threading.Thread(target=_update_loop, args=(c,), daemon=True).start()
 
@@ -1552,5 +1814,6 @@ BIND_TO_PRE_INIT = [init]
 BIND_TO_POST_START = [post_start]
 BIND_TO_NEW_ORDER = [on_new_order]
 BIND_TO_NEW_MESSAGE = [on_new_message]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [on_last_chat_message]
 BIND_TO_ORDER_STATUS_CHANGED = [on_order_status]
 BIND_TO_DELETE = None
