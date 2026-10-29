@@ -22,13 +22,14 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from logging import getLogger
 from types import SimpleNamespace
 
 import requests
 
 NAME = "Vyron OS"
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 DESCRIPTION = "Vyron OS: пополнение баланса, ИИ-консультант, лоты и автообновление. Меню: /vyron"
 CREDITS = "Vyron OS"
 UUID = "5d0b8a3e-2f4c-4e71-a9b6-c38e1f7d2a90"
@@ -549,6 +550,22 @@ AI_HINTS = {
 }
 
 
+KEY_RE = re.compile(r"sk-or-[A-Za-z0-9_\-]{20,}")
+T_BAD_KEY = ("сохранённый ключ OpenRouter неправильный: ключ начинается с sk-or-v1- и состоит только из латинских букв "
+             "и цифр. Скопируйте его заново на openrouter.ai/keys и отправьте /vyron_key КЛЮЧ")
+
+
+def _clean_key(raw) -> str:
+    """The key without the spaces and invisible characters (zero-width, BOM, line breaks) a copy-paste brings along."""
+    return "".join(ch for ch in str(raw or "") if unicodedata.category(ch)[0] not in ("C", "Z"))
+
+
+def _key_state() -> str:
+    """"ok" | "none" | "bad" for the saved OpenRouter key."""
+    key = _clean_key(_config().get("OPENROUTER_API_KEY", ""))
+    return "none" if not key else "ok" if KEY_RE.fullmatch(key) else "bad"
+
+
 def _ai_fail(reason: str) -> None:
     _ai_error.update(text=reason, at=time.time())
     logger.warning(f"[vyron] ИИ не ответил: {reason}")
@@ -561,9 +578,13 @@ def _ask(history: list[dict]) -> str | None:
     p = AI_PROVIDERS[prov]
     headers = {"Content-Type": "application/json"}
     if prov == "openrouter":
-        key = _config().get("OPENROUTER_API_KEY", "")
+        key = _clean_key(_config().get("OPENROUTER_API_KEY", ""))
         if not key:
             _ai_fail("ключ OpenRouter не задан: /vyron_key КЛЮЧ")
+            return None
+        if not KEY_RE.fullmatch(key):
+            # a Cyrillic letter in a header made every request fail with UnicodeEncodeError before it left the PC
+            _ai_fail(T_BAD_KEY)
             return None
         headers.update({"Authorization": "Bearer " + key, "X-Title": "Vyron OS FunPay"})
     errors, codes = [], set()
@@ -574,7 +595,7 @@ def _ask(history: list[dict]) -> str | None:
                 "messages": [{"role": "system", "content": SYSTEM}] + history,
             })
         except Exception as ex:
-            errors.append(f"{model}: нет связи ({type(ex).__name__})")
+            errors.append(f"{model}: запрос не ушёл ({type(ex).__name__}: {str(ex)[:80]})")
             continue
         if r.status_code != 200:
             codes.add(r.status_code)
@@ -1512,12 +1533,12 @@ def screen_main(c):
     today = time.strftime("%Y-%m-%d")
     done_today = [d for d in st["done"].values() if time.strftime("%Y-%m-%d", time.localtime(d.get("at", 0))) == today]
     ai = _ai_load()
-    key = bool(_config().get("OPENROUTER_API_KEY")) or ai_provider() == "ollama"
+    key = _key_state() == "ok" or ai_provider() == "ollama"
     text = (f"⚙️ Vyron OS {VERSION}\n\n"
             f"💰 Пополнения: сегодня {len(done_today)} на ${sum(d.get('amount', 0) for d in done_today):.2f}, "
             f"ждут email: {len(st['pending'])}, нужна помощь: {len(st['manual'])}\n"
             f"🤖 ИИ-консультант: {'включён' if ai_enabled() else 'выключен'}"
-            f"{'' if key else ' (нет ключа!)'}, ответов всего: {ai.get('answered', 0)}\n"
+            f"{'' if key else ' (нет рабочего ключа!)'}, ответов всего: {ai.get('answered', 0)}\n"
             f"🛒 Лоты: {_lots_line()}\n"
             f"🔄 Обновление: {'скачано ' + _upd_pending + ', нужен /restart' if _upd_pending else 'версия ' + VERSION}"
             + ("" if _secret() else "\n\n⚠️ Секрет пополнения не задан: /vyron_secret СЕКРЕТ"))
@@ -1573,12 +1594,13 @@ def screen_confirm(question: str, yes: str, back: str):
 
 def screen_ai(c):
     prov = ai_provider()
-    key = bool(_config().get("OPENROUTER_API_KEY"))
+    key = {"ok": "задан", "none": "НЕ задан — отправьте /vyron_key КЛЮЧ",
+           "bad": "сохранён неправильно (не латиница или не sk-or-…) — отправьте заново /vyron_key КЛЮЧ"}[_key_state()]
     ai = _ai_load()
     text = ("🤖 ИИ-консультант\n\n"
             f"Состояние: {'включён' if ai_enabled() else 'выключен'}\n"
             f"Нейросеть: {'OpenRouter (бесплатные модели)' if prov == 'openrouter' else 'Ollama на этом ПК'}\n"
-            + (f"Ключ OpenRouter: {'задан' if key else 'НЕ задан — отправьте /vyron_key КЛЮЧ'}\n" if prov == "openrouter" else "")
+            + (f"Ключ OpenRouter: {key}\n" if prov == "openrouter" else "")
             + f"Ответов всего: {ai.get('answered', 0)}, просьб об отзыве: {len(ai['reviews'])}\n"
             + (f"⚠️ Последний сбой ({_ago(_ai_error['at'])}): {_ai_error['text'][:500]}\n" if _ai_error["text"] else "")
             + f"\nОтвечает покупателям в чатах, молчит {HUMAN_PAUSE_MIN} мин после вашего сообщения, "
@@ -1734,12 +1756,17 @@ def init(c, *args):
         if len(parts) < 2 or len(parts[1].strip()) < 10:
             bot.send_message(m.chat.id, "Отправьте так: /vyron_key ВАШ_КЛЮЧ_OPENROUTER")
             return
-        _set_config(OPENROUTER_API_KEY=parts[1].strip())
         try:
             bot.delete_message(m.chat.id, m.message_id)   # do not keep the key in the chat history
         except Exception:
             pass
-        bot.send_message(m.chat.id, "Ключ OpenRouter сохранён, ИИ-консультант начнёт отвечать сразу.")
+        key = _clean_key(parts[1])
+        if not KEY_RE.fullmatch(key):
+            bot.send_message(m.chat.id, "Это не похоже на ключ OpenRouter, не сохранил. Ключ начинается с sk-or-v1- и "
+                                        "состоит только из латинских букв и цифр: скопируйте его на openrouter.ai/keys.")
+            return
+        _set_config(OPENROUTER_API_KEY=key)
+        bot.send_message(m.chat.id, "Ключ OpenRouter сохранён. Проверка: /vyron → 🤖 ИИ-консультант → 🧪 Проверить нейросеть.")
 
     def cmd_secret(m):
         if not allowed(m.from_user.id):
