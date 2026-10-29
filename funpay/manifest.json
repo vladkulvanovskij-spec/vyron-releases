@@ -1,9 +1,9 @@
 {
-    "updated":  "2026-10-29T17:51:05Z",
+    "updated":  "2026-10-29T17:58:06Z",
     "files":  {
                   "vyron.py":  {
-                                   "version":  "2.0.1",
-                                   "sha256":  "2757af5749c372490baa161522b1c40c124f660d3c26ec63b54390f9b0c4c35d"
+                                   "version":  "2.0.2",
+                                   "sha256":  "65d1a8bc5f0e47e6effed5c632f7d171261a3632a7b9cd144845707d7f1c557c"
                                }
               }
 }
